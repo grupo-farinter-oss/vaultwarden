@@ -829,6 +829,8 @@ make_config! {
         sso_client_cache_expiration:    u64,    true,   def,    0;
         /// Log all tokens |> `LOG_LEVEL=debug` or `LOG_LEVEL=info,vaultwarden::sso=debug` is required
         sso_debug_tokens:               bool,   true,   def,    false;
+        /// Auto accept organization invites |> Accept organization invitations automatically when a user sets a password.
+        organization_invite_auto_accept: bool,   true,   def,    false;
     },
 
     /// Yubikey settings
