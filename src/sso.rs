@@ -8,12 +8,17 @@ use url::Url;
 use crate::{
     CONFIG,
     api::ApiResult,
+    api::core::{accept_org_invite, log_event},
     auth,
-    auth::{AuthMethod, AuthTokens, BW_EXPIRATION, DEFAULT_REFRESH_VALIDITY, TokenWrapper},
+    auth::{AuthMethod, AuthTokens, BW_EXPIRATION, ClientIp, DEFAULT_REFRESH_VALIDITY, TokenWrapper},
     db::{
         DbConn,
-        models::{Device, OIDCAuthenticatedUser, SsoAuth, SsoUser, User},
+        models::{
+            Device, EventType, Membership, MembershipStatus, MembershipType, OIDCAuthenticatedUser, OrgPolicy,
+            Organization, OrganizationId, SsoAuth, SsoUser, User,
+        },
     },
+    mail,
     sso_client::Client,
 };
 
@@ -315,10 +320,159 @@ pub async fn exchange_code(
     Ok((sso_auth, authenticated_user))
 }
 
+async fn confirm_default_org_membership(
+    user: &User,
+    device: &Device,
+    ip: &ClientIp,
+    org: &Organization,
+    mut member: Membership,
+    conn: &DbConn,
+) -> ApiResult<()> {
+    if member.status != MembershipStatus::Accepted as i32 || user.akey.is_empty() {
+        return Ok(());
+    }
+
+    member.akey = user.akey.clone();
+    member.status = MembershipStatus::Confirmed as i32;
+
+    OrgPolicy::check_user_allowed(&member, "confirm", conn).await?;
+
+    log_event(
+        EventType::OrganizationUserConfirmed as i32,
+        &member.uuid,
+        &org.uuid,
+        &user.uuid,
+        device.atype,
+        &ip.ip,
+        conn,
+    )
+    .await;
+
+    if CONFIG.mail_enabled() {
+        if let Err(err) = mail::send_invite_confirmed(&user.email, &org.name).await {
+            error!("Failed to send SSO default org confirmation mail to {}: {err}", user.email);
+        }
+    }
+
+    member.save(conn).await?;
+    Ok(())
+}
+
+pub(crate) async fn reconcile_default_org_membership(
+    user: &User,
+    device: &Device,
+    ip: &ClientIp,
+    conn: &DbConn,
+) -> ApiResult<()> {
+    if !CONFIG.sso_org_auto_provision() && !CONFIG.sso_org_invite_auto_accept() {
+        return Ok(());
+    }
+
+    let Some(default_org_id) = CONFIG.sso_default_org_id() else {
+        err!("SSO_DEFAULT_ORG_ID must be configured when SSO organization provisioning is enabled")
+    };
+
+    let org_id: OrganizationId = default_org_id.into();
+    let Some(org) = Organization::find_by_uuid(&org_id, conn).await else {
+        err!(format!("Configured SSO default organization {org_id} does not exist"))
+    };
+
+    if let Some(member) = Membership::find_by_user_and_org(&user.uuid, &org.uuid, conn).await {
+        match member.status {
+            x if x == MembershipStatus::Confirmed as i32 => Ok(()),
+            x if x == MembershipStatus::Accepted as i32 => {
+                if CONFIG.sso_org_invite_auto_accept() {
+                    confirm_default_org_membership(user, device, ip, &org, member, conn).await
+                } else {
+                    Ok(())
+                }
+            }
+            x if x == MembershipStatus::Invited as i32 => {
+                if !CONFIG.sso_org_invite_auto_accept() {
+                    return Ok(());
+                }
+
+                accept_org_invite(user, member, None, conn).await?;
+
+                if let Some(updated_member) = Membership::find_by_user_and_org(&user.uuid, &org.uuid, conn).await {
+                    if let Err(err) = confirm_default_org_membership(user, device, ip, &org, updated_member, conn).await
+                    {
+                        error!("Failed to confirm default SSO organization membership for {}: {err}", user.email);
+                    }
+                }
+
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    } else {
+        if !CONFIG.sso_org_auto_provision() {
+            return Ok(());
+        }
+
+        let mut member = Membership::new(user.uuid.clone(), org.uuid.clone(), Some(org.billing_email.clone()));
+        member.access_all = false;
+        member.atype = MembershipType::User as i32;
+
+        if CONFIG.sso_org_invite_auto_accept() {
+            if user.akey.is_empty() {
+                member.status = MembershipStatus::Accepted as i32;
+                OrgPolicy::check_user_allowed(&member, "join", conn).await?;
+            } else {
+                member.status = MembershipStatus::Confirmed as i32;
+                member.akey = user.akey.clone();
+                OrgPolicy::check_user_allowed(&member, "confirm", conn).await?;
+            }
+        } else {
+            member.status = MembershipStatus::Invited as i32;
+            OrgPolicy::check_user_allowed(&member, "join", conn).await?;
+        }
+
+        member.save(conn).await?;
+
+        log_event(
+            if member.status == MembershipStatus::Confirmed as i32 {
+                EventType::OrganizationUserConfirmed as i32
+            } else {
+                EventType::OrganizationUserInvited as i32
+            },
+            &member.uuid,
+            &org.uuid,
+            &user.uuid,
+            device.atype,
+            &ip.ip,
+            conn,
+        )
+        .await;
+
+        if CONFIG.mail_enabled() {
+            let mail_result = if member.status == MembershipStatus::Confirmed as i32 {
+                mail::send_invite_confirmed(&user.email, &org.name).await
+            } else {
+                mail::send_invite(
+                    user,
+                    org.uuid.clone(),
+                    member.uuid.clone(),
+                    &org.name,
+                    Some(org.billing_email.clone()),
+                )
+                .await
+            };
+
+            if let Err(err) = mail_result {
+                error!("Failed to send SSO default org notification to {}: {err}", user.email);
+            }
+        }
+
+        Ok(())
+    }
+}
+
 // User has passed 2FA flow we can delete auth info from database
 pub async fn redeem(
     device: &Device,
     user: &User,
+    ip: &ClientIp,
     client_id: Option<String>,
     sso_user: Option<SsoUser>,
     sso_auth: SsoAuth,
@@ -334,6 +488,8 @@ pub async fn redeem(
         };
         user_sso.save(conn).await?;
     }
+
+    reconcile_default_org_membership(user, device, ip, conn).await?;
 
     if CONFIG.sso_auth_only_not_session() {
         Ok(AuthTokens::new(device, user, AuthMethod::Sso, client_id))

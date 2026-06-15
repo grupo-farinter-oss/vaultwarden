@@ -270,7 +270,7 @@ fn api_not_found() -> Json<Value> {
     }))
 }
 
-async fn accept_org_invite(
+pub(crate) async fn accept_org_invite(
     user: &User,
     mut member: Membership,
     reset_password_key: Option<String>,
@@ -293,8 +293,12 @@ async fn accept_org_invite(
             err!("Organization not found.")
         };
         // User was invited to an organization, so they must be confirmed manually after acceptance
-        mail::send_invite_accepted(&user.email, &member.invited_by_email.unwrap_or(org.billing_email), &org.name)
-            .await?;
+        if let Err(err) =
+            mail::send_invite_accepted(&user.email, &member.invited_by_email.unwrap_or(org.billing_email), &org.name)
+                .await
+        {
+            error!("Failed to send invite accepted mail for {}: {err}", user.email);
+        }
     }
 
     Ok(())

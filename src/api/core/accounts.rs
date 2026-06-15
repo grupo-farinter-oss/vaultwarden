@@ -22,7 +22,7 @@ use crate::{
         models::{
             AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceType, DeviceWithAuthRequest,
             EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, Membership, MembershipId,
-            OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, User, UserId, UserKdfType,
+            OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, SsoUser, User, UserId, UserKdfType,
         },
     },
     mail,
@@ -378,29 +378,35 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
 
     user.save(&conn).await?;
 
+    let is_sso_user = SsoUser::find_by_mail(&user.email, &conn).await.is_some();
+    if is_sso_user && (CONFIG.sso_org_auto_provision() || CONFIG.sso_org_invite_auto_accept()) {
+        crate::sso::reconcile_default_org_membership(&user, &headers.device, &headers.ip, &conn).await?;
+    }
+
     log_user_event(EventType::UserChangedPassword as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &conn)
         .await;
 
-    if CONFIG.organization_invite_auto_accept() || !CONFIG.mail_enabled() {
-        Membership::accept_user_invitations(&user.uuid, &conn).await?;
-    } else if let Some(identifier) = data.org_identifier
-        && identifier != crate::sso::FAKE_SSO_IDENTIFIER
-        && identifier != crate::api::admin::FAKE_ADMIN_UUID
-    {
-        let Some(org) = Organization::find_by_uuid(&identifier.into(), &conn).await else {
-            err!("Failed to retrieve the associated organization")
-        };
+    if !is_sso_user {
+        if CONFIG.sso_org_invite_auto_accept() || !CONFIG.mail_enabled() {
+            Membership::accept_user_invitations(&user.uuid, &conn).await?;
+        } else if let Some(identifier) = data.org_identifier {
+            if identifier != crate::sso::FAKE_SSO_IDENTIFIER && identifier != crate::api::admin::FAKE_ADMIN_UUID {
+                let Some(org) = Organization::find_by_uuid(&identifier.into(), &conn).await else {
+                    err!("Failed to retrieve the associated organization")
+                };
 
-        let Some(membership) = Membership::find_by_user_and_org(&user.uuid, &org.uuid, &conn).await else {
-            err!("Failed to retrieve the invitation")
-        };
+                let Some(membership) = Membership::find_by_user_and_org(&user.uuid, &org.uuid, &conn).await else {
+                    err!("Failed to retrieve the invitation")
+                };
 
-        accept_org_invite(&user, membership, None, &conn).await?;
+                accept_org_invite(&user, membership, None, &conn).await?;
+            }
+        }
     }
 
     if CONFIG.mail_enabled() {
         mail::send_welcome(&user.email.to_lowercase()).await?;
-        if CONFIG.organization_invite_auto_accept() {
+        if CONFIG.sso_org_invite_auto_accept() && !is_sso_user {
             for (member, org) in Membership::find_accepted_by_user(&user.uuid, &conn).await {
                 mail::send_enrolled(&user.email, &org.name).await?;
                 mail::send_invite_accepted(

@@ -30,6 +30,9 @@ services:
       - SMTP_HOST
       - SMTP_FROM
       - SMTP_DEBUG
+      - SSO_DEFAULT_ORG_ID
+      - SSO_ORG_INVITE_AUTO_ACCEPT
+      - SSO_ORG_AUTO_PROVISION
       - SSO_DEBUG_TOKENS
       - SSO_ENABLED
       - SSO_FRONTEND

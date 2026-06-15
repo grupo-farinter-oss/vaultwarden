@@ -829,8 +829,12 @@ make_config! {
         sso_client_cache_expiration:    u64,    true,   def,    0;
         /// Log all tokens |> `LOG_LEVEL=debug` or `LOG_LEVEL=info,vaultwarden::sso=debug` is required
         sso_debug_tokens:               bool,   true,   def,    false;
-        /// Auto accept organization invites |> Accept organization invitations automatically when a user sets a password.
-        organization_invite_auto_accept: bool,   true,   def,    false;
+        /// Default organization UUID for SSO auto provisioning |> Must point at an existing organization UUID.
+        sso_default_org_id:             String, true,   option;
+        /// Auto accept organization invites during SSO login |> Applies only to the SSO reconciliation path.
+        sso_org_invite_auto_accept:     bool,   true,   def,    false;
+        /// Auto provision the default organization during SSO login |> Creates the membership if it does not exist yet.
+        sso_org_auto_provision:         bool,   true,   def,    false;
     },
 
     /// Yubikey settings
