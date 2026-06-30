@@ -5,6 +5,8 @@ import * as OTPAuth from "otpauth";
 import * as utils from '../../global-utils';
 import { retrieveEmailCode } from './2fa';
 
+const keycloakSignInHeading = /Sign in to (your account|test)/;
+
 /**
  * If a MailBuffer is passed it will be used and consume the expected emails
  */
@@ -25,7 +27,7 @@ export async function logNewUser(
         });
 
         await test.step('Keycloak login', async () => {
-            await expect(page.getByRole('heading', { name: 'Sign in to your account' })).toBeVisible();
+            await expect(page.getByRole('heading', { name: keycloakSignInHeading })).toBeVisible();
             await page.getByLabel(/Username/).fill(user.name);
             await page.getByLabel('Password', { exact: true }).fill(user.password);
             await page.getByRole('button', { name: 'Sign In' }).click();
@@ -84,7 +86,7 @@ export async function logUser(
         });
 
         await test.step('Keycloak login', async () => {
-            await expect(page.getByRole('heading', { name: 'Sign in to your account' })).toBeVisible();
+            await expect(page.getByRole('heading', { name: keycloakSignInHeading })).toBeVisible();
             await page.getByLabel(/Username/).fill(user.name);
             await page.getByLabel('Password', { exact: true }).fill(user.password);
             await page.getByRole('button', { name: 'Sign In' }).click();

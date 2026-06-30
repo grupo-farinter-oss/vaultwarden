@@ -5,6 +5,8 @@ import * as utils from "../global-utils";
 import * as orgs from './setups/orgs';
 import { logNewUser, logUser } from './setups/sso';
 
+const keycloakSignInHeading = /Sign in to (your account|test)/;
+
 let users = utils.loadEnv();
 
 let mailServer, mail1Buffer, mail2Buffer, mail3Buffer;
@@ -59,7 +61,7 @@ test('invited with new account', async ({ page }) => {
     });
 
     await test.step('Keycloak login', async () => {
-        await expect(page.getByRole('heading', { name: 'Sign in to your account' })).toBeVisible();
+        await expect(page.getByRole('heading', { name: keycloakSignInHeading })).toBeVisible();
         await page.getByLabel(/Username/).fill(users.user2.name);
         await page.getByLabel('Password', { exact: true }).fill(users.user2.password);
         await page.getByRole('button', { name: 'Sign In' }).click();
@@ -98,7 +100,7 @@ test('invited with existing account', async ({ page }) => {
     });
 
     await test.step('Keycloak login', async () => {
-        await expect(page.getByRole('heading', { name: 'Sign in to your account' })).toBeVisible();
+        await expect(page.getByRole('heading', { name: keycloakSignInHeading })).toBeVisible();
         await page.getByLabel(/Username/).fill(users.user3.name);
         await page.getByLabel('Password', { exact: true }).fill(users.user3.password);
         await page.getByRole('button', { name: 'Sign In' }).click();
