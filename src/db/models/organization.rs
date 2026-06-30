@@ -859,23 +859,8 @@ impl Membership {
         .await
     }
 
-    pub async fn find_accepted_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<(Self, Organization)> {
-        conn.run(move |conn| {
-            users_organizations::table
-                .filter(users_organizations::user_uuid.eq(user_uuid))
-                .filter(users_organizations::status.eq(MembershipStatus::Accepted as i32))
-                .inner_join(organizations::table.on(organizations::uuid.eq(users_organizations::org_uuid)))
-                .select((users_organizations::all_columns, organizations::all_columns))
-                .load::<(Self, Organization)>(conn)
-                .unwrap_or_default()
-        })
-        .await
-    }
-
     // In Organizations::send_invite status is set to Accepted only if the user has a password.
-    // As such should only be used
-    //  - when email are disabled.
-    //  - when sso_org_invite_auto_accept is active.
+    // As such should only be used when email are disabled.
     pub async fn accept_user_invitations(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
         conn.run(move |conn| {
             diesel::update(users_organizations::table)

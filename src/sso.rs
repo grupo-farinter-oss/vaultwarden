@@ -1,7 +1,9 @@
 use std::{sync::LazyLock, time::Duration};
 
 use chrono::Utc;
+use data_encoding::BASE64;
 use derive_more::{AsRef, Deref, Display, From, Into};
+use openssl::{pkey::PKey, rsa::Padding};
 use regex::Regex;
 use url::Url;
 
@@ -14,8 +16,8 @@ use crate::{
     db::{
         DbConn,
         models::{
-            Device, EventType, Membership, MembershipStatus, MembershipType, OIDCAuthenticatedUser, OrgPolicy,
-            Organization, OrganizationId, SsoAuth, SsoUser, User,
+            Collection, Device, EventType, Membership, MembershipStatus, MembershipType, OIDCAuthenticatedUser,
+            OrgPolicy, Organization, OrganizationId, SsoAuth, SsoUser, User,
         },
     },
     mail,
@@ -176,7 +178,7 @@ fn decode_token_claims(token_name: &str, token: &str) -> ApiResult<BasicTokenCla
 }
 
 pub fn decode_state(base64_state: &str) -> ApiResult<OIDCState> {
-    let state = if let Ok(vec) = data_encoding::BASE64.decode(base64_state.as_bytes()) {
+    let state = if let Ok(vec) = BASE64.decode(base64_state.as_bytes()) {
         if let Ok(valid) = String::from_utf8(vec) {
             OIDCState(valid)
         } else {
@@ -320,7 +322,37 @@ pub async fn exchange_code(
     Ok((sso_auth, authenticated_user))
 }
 
-async fn confirm_default_org_membership(
+fn encrypt_org_key_for_user(org_key: &[u8], user_public_key: &str) -> ApiResult<String> {
+    let public_key_der = match BASE64.decode(user_public_key.as_bytes()) {
+        Ok(public_key_der) => public_key_der,
+        Err(err) => err!(format!("Failed to decode SSO auto-confirm user public key: {err}")),
+    };
+
+    let public_key = match PKey::public_key_from_der(&public_key_der) {
+        Ok(public_key) => public_key,
+        Err(err) => err!(format!("Failed to parse SSO auto-confirm user public key: {err}")),
+    };
+
+    let rsa = match public_key.rsa() {
+        Ok(rsa) => rsa,
+        Err(err) => err!(format!("SSO auto-confirm user public key is not RSA: {err}")),
+    };
+
+    let mut encrypted_key = vec![0; rsa.size() as usize];
+    let encrypted_len = match rsa.public_encrypt(org_key, &mut encrypted_key, Padding::PKCS1_OAEP) {
+        Ok(encrypted_len) => encrypted_len,
+        Err(err) => err!(format!("Failed to encrypt SSO auto-confirm org key: {err}")),
+    };
+    encrypted_key.truncate(encrypted_len);
+
+    Ok(format!("4.{}", BASE64.encode(&encrypted_key)))
+}
+
+pub(crate) fn is_reserved_sso_org_bot_email(email: &str) -> bool {
+    CONFIG.sso_org_bootstrap() && email.eq_ignore_ascii_case(&CONFIG.sso_org_bot_email())
+}
+
+async fn auto_confirm_default_org_membership(
     user: &User,
     device: &Device,
     ip: &ClientIp,
@@ -328,11 +360,24 @@ async fn confirm_default_org_membership(
     mut member: Membership,
     conn: &DbConn,
 ) -> ApiResult<()> {
-    if member.status != MembershipStatus::Accepted as i32 || user.akey.is_empty() {
+    if !CONFIG.sso_org_auto_confirm() || member.status != MembershipStatus::Accepted as i32 {
         return Ok(());
     }
 
-    member.akey = user.akey.clone();
+    let Some(org_key_b64) = CONFIG.sso_org_auto_confirm_key() else {
+        err!("SSO_ORG_AUTO_CONFIRM_KEY must be configured when SSO_ORG_AUTO_CONFIRM is enabled")
+    };
+
+    let Some(user_public_key) = user.public_key.as_deref() else {
+        err!(format!("SSO auto-confirm requires a public key for {}", user.email))
+    };
+
+    let org_key = match BASE64.decode(org_key_b64.as_bytes()) {
+        Ok(org_key) => org_key,
+        Err(err) => err!(format!("Failed to decode SSO_ORG_AUTO_CONFIRM_KEY: {err}")),
+    };
+
+    member.akey = encrypt_org_key_for_user(&org_key, user_public_key)?;
     member.status = MembershipStatus::Confirmed as i32;
 
     OrgPolicy::check_user_allowed(&member, "confirm", conn).await?;
@@ -348,14 +393,118 @@ async fn confirm_default_org_membership(
     )
     .await;
 
-    if CONFIG.mail_enabled() {
-        if let Err(err) = mail::send_invite_confirmed(&user.email, &org.name).await {
-            error!("Failed to send SSO default org confirmation mail to {}: {err}", user.email);
-        }
+    if CONFIG.mail_enabled()
+        && let Err(err) = mail::send_invite_confirmed(&user.email, &org.name).await
+    {
+        error!("Failed to send SSO default org confirmation mail to {}: {err}", user.email);
     }
 
     member.save(conn).await?;
     Ok(())
+}
+
+async fn ensure_sso_org_bot_membership(org: &Organization, conn: &DbConn) -> ApiResult<()> {
+    if !CONFIG.sso_org_bootstrap() {
+        return Ok(());
+    }
+
+    let bot_email = CONFIG.sso_org_bot_email().to_lowercase();
+    let bot = if let Some(bot) = User::find_by_mail(&bot_email, conn).await {
+        if matches!(SsoUser::find_by_mail(&bot_email, conn).await, Some((_, Some(_))))
+            || bot.private_key.is_some()
+            || bot.name != "SSO Organization Bot"
+        {
+            err!(format!("SSO_ORG_BOT_EMAIL {bot_email} is already used by an interactive or SSO-linked account"));
+        }
+        bot
+    } else {
+        let mut bot = User::new(&bot_email, Some("SSO Organization Bot".to_owned()));
+        bot.verified_at = Some(Utc::now().naive_utc());
+        bot.save(conn).await?;
+        bot
+    };
+
+    if let Some(mut member) = Membership::find_by_user_and_org(&bot.uuid, &org.uuid, conn).await {
+        let changed = if member.atype == MembershipType::Owner as i32 {
+            false
+        } else {
+            member.atype = MembershipType::Owner as i32;
+            true
+        };
+        let changed = if member.status == MembershipStatus::Confirmed as i32 {
+            changed
+        } else {
+            member.status = MembershipStatus::Confirmed as i32;
+            true
+        };
+        let changed = if member.access_all {
+            changed
+        } else {
+            member.access_all = true;
+            true
+        };
+        if changed {
+            member.save(conn).await?;
+        }
+    } else {
+        let mut member = Membership::new(bot.uuid, org.uuid.clone(), None);
+        member.access_all = true;
+        member.atype = MembershipType::Owner as i32;
+        member.status = MembershipStatus::Confirmed as i32;
+        member.save(conn).await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_sso_org_bootstrap_collection(org: &Organization, conn: &DbConn) -> ApiResult<()> {
+    let collection_name = CONFIG.sso_org_bootstrap_collection_name();
+    if Collection::find_by_organization(&org.uuid, conn)
+        .await
+        .iter()
+        .any(|collection| collection.name == collection_name)
+    {
+        return Ok(());
+    }
+
+    let collection = Collection::new(org.uuid.clone(), collection_name, None);
+    collection.save(conn).await
+}
+
+async fn bootstrap_default_sso_org(org_id: OrganizationId, conn: &DbConn) -> ApiResult<Organization> {
+    let Some(org_name) = CONFIG.sso_org_bootstrap_name() else {
+        err!("SSO_ORG_BOOTSTRAP_NAME must be configured when SSO_ORG_BOOTSTRAP is enabled")
+    };
+    let Some(billing_email) = CONFIG.sso_org_bootstrap_billing_email() else {
+        err!("SSO_ORG_BOOTSTRAP_BILLING_EMAIL must be configured when SSO_ORG_BOOTSTRAP is enabled")
+    };
+
+    let mut org = Organization::new(org_name, &billing_email, None, None);
+    org.uuid = org_id;
+    org.save(conn).await?;
+
+    ensure_sso_org_bootstrap_collection(&org, conn).await?;
+    ensure_sso_org_bot_membership(&org, conn).await?;
+    Ok(org)
+}
+
+async fn resolve_default_sso_org(conn: &DbConn) -> ApiResult<Organization> {
+    let configured_org_id = CONFIG.sso_default_org_id().map(OrganizationId::from);
+
+    if let Some(org_id) = configured_org_id.clone() {
+        if let Some(org) = Organization::find_by_uuid(&org_id, conn).await {
+            ensure_sso_org_bot_membership(&org, conn).await?;
+            return Ok(org);
+        }
+
+        if !CONFIG.sso_org_bootstrap() {
+            err!(format!("Configured SSO default organization {org_id} does not exist"));
+        }
+
+        return bootstrap_default_sso_org(org_id, conn).await;
+    }
+
+    err!("SSO_DEFAULT_ORG_ID must be configured when SSO organization provisioning is enabled")
 }
 
 pub(crate) async fn reconcile_default_org_membership(
@@ -368,24 +517,13 @@ pub(crate) async fn reconcile_default_org_membership(
         return Ok(());
     }
 
-    let Some(default_org_id) = CONFIG.sso_default_org_id() else {
-        err!("SSO_DEFAULT_ORG_ID must be configured when SSO organization provisioning is enabled")
-    };
-
-    let org_id: OrganizationId = default_org_id.into();
-    let Some(org) = Organization::find_by_uuid(&org_id, conn).await else {
-        err!(format!("Configured SSO default organization {org_id} does not exist"))
-    };
+    let org = resolve_default_sso_org(conn).await?;
 
     if let Some(member) = Membership::find_by_user_and_org(&user.uuid, &org.uuid, conn).await {
         match member.status {
             x if x == MembershipStatus::Confirmed as i32 => Ok(()),
             x if x == MembershipStatus::Accepted as i32 => {
-                if CONFIG.sso_org_invite_auto_accept() {
-                    confirm_default_org_membership(user, device, ip, &org, member, conn).await
-                } else {
-                    Ok(())
-                }
+                auto_confirm_default_org_membership(user, device, ip, &org, member, conn).await
             }
             x if x == MembershipStatus::Invited as i32 => {
                 if !CONFIG.sso_org_invite_auto_accept() {
@@ -394,11 +532,18 @@ pub(crate) async fn reconcile_default_org_membership(
 
                 accept_org_invite(user, member, None, conn).await?;
 
-                if let Some(updated_member) = Membership::find_by_user_and_org(&user.uuid, &org.uuid, conn).await {
-                    if let Err(err) = confirm_default_org_membership(user, device, ip, &org, updated_member, conn).await
-                    {
-                        error!("Failed to confirm default SSO organization membership for {}: {err}", user.email);
-                    }
+                if let Some(updated_member) = Membership::find_by_user_and_org(&user.uuid, &org.uuid, conn).await
+                    && let Err(err) =
+                        auto_confirm_default_org_membership(user, device, ip, &org, updated_member, conn).await
+                {
+                    error!("Failed to auto-confirm default SSO organization membership for {}: {err}", user.email);
+                }
+
+                if CONFIG.mail_enabled()
+                    && !CONFIG.sso_org_auto_confirm()
+                    && let Err(err) = mail::send_enrolled(&user.email, &org.name).await
+                {
+                    error!("Failed to send SSO default org enrollment mail to {}: {err}", user.email);
                 }
 
                 Ok(())
@@ -415,27 +560,21 @@ pub(crate) async fn reconcile_default_org_membership(
         member.atype = MembershipType::User as i32;
 
         if CONFIG.sso_org_invite_auto_accept() {
-            if user.akey.is_empty() {
-                member.status = MembershipStatus::Accepted as i32;
-                OrgPolicy::check_user_allowed(&member, "join", conn).await?;
-            } else {
-                member.status = MembershipStatus::Confirmed as i32;
-                member.akey = user.akey.clone();
-                OrgPolicy::check_user_allowed(&member, "confirm", conn).await?;
-            }
+            member.status = MembershipStatus::Accepted as i32;
         } else {
             member.status = MembershipStatus::Invited as i32;
-            OrgPolicy::check_user_allowed(&member, "join", conn).await?;
+        }
+        OrgPolicy::check_user_allowed(&member, "join", conn).await?;
+
+        if let Err(err) = member.save(conn).await {
+            if Membership::find_by_user_and_org(&user.uuid, &org.uuid, conn).await.is_some() {
+                return Ok(());
+            }
+            return Err(err);
         }
 
-        member.save(conn).await?;
-
         log_event(
-            if member.status == MembershipStatus::Confirmed as i32 {
-                EventType::OrganizationUserConfirmed as i32
-            } else {
-                EventType::OrganizationUserInvited as i32
-            },
+            EventType::OrganizationUserInvited as i32,
             &member.uuid,
             &org.uuid,
             &user.uuid,
@@ -445,9 +584,16 @@ pub(crate) async fn reconcile_default_org_membership(
         )
         .await;
 
+        if CONFIG.sso_org_auto_confirm() {
+            if let Err(err) = auto_confirm_default_org_membership(user, device, ip, &org, member, conn).await {
+                error!("Failed to auto-confirm default SSO organization membership for {}: {err}", user.email);
+            }
+            return Ok(());
+        }
+
         if CONFIG.mail_enabled() {
-            let mail_result = if member.status == MembershipStatus::Confirmed as i32 {
-                mail::send_invite_confirmed(&user.email, &org.name).await
+            let mail_result = if member.status == MembershipStatus::Accepted as i32 {
+                mail::send_enrolled(&user.email, &org.name).await
             } else {
                 mail::send_invite(
                     user,
@@ -469,6 +615,7 @@ pub(crate) async fn reconcile_default_org_membership(
 }
 
 // User has passed 2FA flow we can delete auth info from database
+#[expect(clippy::too_many_arguments)]
 pub async fn redeem(
     device: &Device,
     user: &User,
@@ -625,5 +772,30 @@ pub async fn exchange_refresh_token(
             create_auth_tokens_impl(device, None, access_claims, access_token)
         }
         None => err!("No token present while in SSO"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openssl::rsa::Rsa;
+
+    #[test]
+    fn encrypt_org_key_for_user_uses_bitwarden_rsa_oaep_sha1_cipher_string() {
+        let rsa = Rsa::generate(2048).expect("test rsa key should be generated");
+        let public_key = BASE64.encode(&rsa.public_key_to_der().expect("test public key should serialize"));
+        let org_key = [7_u8; 64];
+
+        let encrypted = encrypt_org_key_for_user(&org_key, &public_key).expect("org key should encrypt");
+        let encrypted_payload = encrypted.strip_prefix("4.").expect("Bitwarden RSA-OAEP-SHA1 prefix is required");
+        let encrypted_bytes = BASE64.decode(encrypted_payload.as_bytes()).expect("payload should be base64");
+
+        let mut decrypted = vec![0; rsa.size() as usize];
+        let decrypted_len = rsa
+            .private_decrypt(&encrypted_bytes, &mut decrypted, Padding::PKCS1_OAEP)
+            .expect("payload should decrypt with matching private key");
+        decrypted.truncate(decrypted_len);
+
+        assert_eq!(decrypted, org_key);
     }
 }

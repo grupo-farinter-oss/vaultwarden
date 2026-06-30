@@ -43,7 +43,8 @@ A nearly complete implementation of the Bitwarden Client API is provided, includ
      [Event Logs](https://bitwarden.com/help/event-logs/),
      [Admin Password Reset](https://bitwarden.com/help/admin-reset/),
      [Directory Connector](https://bitwarden.com/help/directory-sync/),
-     [Policies](https://bitwarden.com/help/policies/)
+    [Policies](https://bitwarden.com/help/policies/),
+    [SSO organization auto-provisioning](docs/sso-org-auto-provisioning.md)
  * [Multi/Two Factor Authentication](https://bitwarden.com/help/bitwarden-field-guide-two-step-login/)
    - [Authenticator](https://bitwarden.com/help/setup-two-step-login-authenticator/),
      [Email](https://bitwarden.com/help/setup-two-step-login-email/),

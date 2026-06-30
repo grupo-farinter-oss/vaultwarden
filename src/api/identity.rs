@@ -205,6 +205,20 @@ async fn sso_login(
     };
 
     let (sso_auth, user_infos) = sso::exchange_code(code, code_verifier, conn).await?;
+
+    if sso::is_reserved_sso_org_bot_email(&user_infos.email) {
+        error!(
+            "Login failure ({}), SSO_ORG_BOT_EMAIL ({}) is reserved for internal bootstrap ownership",
+            user_infos.identifier, user_infos.email
+        );
+        err_silent!(
+            "Reserved SSO organization bot email",
+            ErrorEvent {
+                event: EventType::UserFailedLogIn
+            }
+        )
+    }
+
     let user_with_sso = match SsoUser::find_by_identifier(&user_infos.identifier, conn).await {
         None => match SsoUser::find_by_mail(&user_infos.email, conn).await {
             None => None,
@@ -340,7 +354,7 @@ async fn sso_login(
     *user_id = Some(user.uuid.clone());
 
     // We passed 2FA get auth tokens
-    let auth_tokens = sso::redeem(&device, &user, &ip, data.client_id, sso_user, sso_auth, user_infos, conn).await?;
+    let auth_tokens = sso::redeem(&device, &user, ip, data.client_id, sso_user, sso_auth, user_infos, conn).await?;
 
     authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
 }

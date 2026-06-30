@@ -387,36 +387,26 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
         .await;
 
     if !is_sso_user {
-        if CONFIG.sso_org_invite_auto_accept() || !CONFIG.mail_enabled() {
+        if !CONFIG.mail_enabled() {
             Membership::accept_user_invitations(&user.uuid, &conn).await?;
-        } else if let Some(identifier) = data.org_identifier {
-            if identifier != crate::sso::FAKE_SSO_IDENTIFIER && identifier != crate::api::admin::FAKE_ADMIN_UUID {
-                let Some(org) = Organization::find_by_uuid(&identifier.into(), &conn).await else {
-                    err!("Failed to retrieve the associated organization")
-                };
+        } else if let Some(identifier) = data.org_identifier
+            && identifier != crate::sso::FAKE_SSO_IDENTIFIER
+            && identifier != crate::api::admin::FAKE_ADMIN_UUID
+        {
+            let Some(org) = Organization::find_by_uuid(&identifier.into(), &conn).await else {
+                err!("Failed to retrieve the associated organization")
+            };
 
-                let Some(membership) = Membership::find_by_user_and_org(&user.uuid, &org.uuid, &conn).await else {
-                    err!("Failed to retrieve the invitation")
-                };
+            let Some(membership) = Membership::find_by_user_and_org(&user.uuid, &org.uuid, &conn).await else {
+                err!("Failed to retrieve the invitation")
+            };
 
-                accept_org_invite(&user, membership, None, &conn).await?;
-            }
+            accept_org_invite(&user, membership, None, &conn).await?;
         }
     }
 
     if CONFIG.mail_enabled() {
         mail::send_welcome(&user.email.to_lowercase()).await?;
-        if CONFIG.sso_org_invite_auto_accept() && !is_sso_user {
-            for (member, org) in Membership::find_accepted_by_user(&user.uuid, &conn).await {
-                mail::send_enrolled(&user.email, &org.name).await?;
-                mail::send_invite_accepted(
-                    &user.email,
-                    &member.invited_by_email.unwrap_or(org.billing_email),
-                    &org.name,
-                )
-                .await?;
-            }
-        }
     }
 
     Ok(Json(json!({
