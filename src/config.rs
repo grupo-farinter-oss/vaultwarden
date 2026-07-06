@@ -829,6 +829,26 @@ make_config! {
         sso_client_cache_expiration:    u64,    true,   def,    0;
         /// Log all tokens |> `LOG_LEVEL=debug` or `LOG_LEVEL=info,vaultwarden::sso=debug` is required
         sso_debug_tokens:               bool,   true,   def,    false;
+        /// Default organization UUID for SSO auto provisioning |> Must point at an existing organization UUID.
+        sso_default_org_id:             String, true,   option;
+        /// Auto accept organization invites during SSO login |> Applies only to the SSO reconciliation path.
+        sso_org_invite_auto_accept:     bool,   true,   def,    false;
+        /// Auto provision the default organization during SSO login |> Creates the membership if it does not exist yet.
+        sso_org_auto_provision:         bool,   true,   def,    false;
+        /// Auto confirm default organization memberships during SSO login |> Requires `SSO_ORG_AUTO_CONFIRM_KEY`.
+        sso_org_auto_confirm:           bool,   true,   def,    false;
+        /// Default organization symmetric key for SSO auto confirmation |> Base64 encoded organization key used by the internal admin bot.
+        sso_org_auto_confirm_key:       Pass,   true,   option;
+        /// Bootstrap default SSO organization |> Creates the default organization if it does not exist and ensures the internal bot owner membership.
+        sso_org_bootstrap:              bool,   true,   def,    false;
+        /// Default SSO organization name used for bootstrap or lookup when `SSO_DEFAULT_ORG_ID` is unset.
+        sso_org_bootstrap_name:         String, true,   option;
+        /// Default SSO organization billing email used when bootstrap creates the organization.
+        sso_org_bootstrap_billing_email: String, true,  option;
+        /// Default SSO organization collection name used when bootstrap creates the organization.
+        sso_org_bootstrap_collection_name: String, true, def, "Default collection".to_owned();
+        /// Internal SSO organization bot email |> Used for the owner membership created by bootstrap.
+        sso_org_bot_email:              String, true,   def,    "sso-org-bot@vaultwarden.local".to_owned();
     },
 
     /// Yubikey settings
@@ -991,6 +1011,45 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         && org_creation_users.split(',').any(|u| !u.contains('@'))
     {
         err!("`ORG_CREATION_USERS` contains invalid email addresses");
+    }
+
+    if cfg.sso_org_auto_confirm {
+        if cfg.sso_default_org_id.as_ref().is_none_or(|id| id.trim().is_empty()) {
+            err!("`SSO_DEFAULT_ORG_ID` is required when `SSO_ORG_AUTO_CONFIRM=true`");
+        }
+        if !cfg.sso_org_invite_auto_accept {
+            err!("`SSO_ORG_INVITE_AUTO_ACCEPT=true` is required when `SSO_ORG_AUTO_CONFIRM=true`");
+        }
+        let Some(org_key_b64) = cfg.sso_org_auto_confirm_key.as_ref() else {
+            err!("`SSO_ORG_AUTO_CONFIRM_KEY` is required when `SSO_ORG_AUTO_CONFIRM=true`");
+        };
+        let Ok(org_key) = data_encoding::BASE64.decode(org_key_b64.as_bytes()) else {
+            err!("`SSO_ORG_AUTO_CONFIRM_KEY` must be base64 encoded");
+        };
+        if !matches!(org_key.len(), 32 | 64) {
+            err!("`SSO_ORG_AUTO_CONFIRM_KEY` must decode to a 32 or 64 byte organization key");
+        }
+    }
+
+    if cfg.sso_org_bootstrap {
+        if cfg.sso_default_org_id.as_ref().is_none_or(|id| id.trim().is_empty()) {
+            err!("`SSO_DEFAULT_ORG_ID` is required when `SSO_ORG_BOOTSTRAP=true`");
+        }
+        if cfg.sso_org_bootstrap_name.as_ref().is_none_or(|name| name.trim().is_empty()) {
+            err!("`SSO_ORG_BOOTSTRAP_NAME` is required when `SSO_ORG_BOOTSTRAP=true`");
+        }
+        if cfg.sso_org_bootstrap_billing_email.as_ref().is_none_or(|email| email.trim().is_empty()) {
+            err!("`SSO_ORG_BOOTSTRAP_BILLING_EMAIL` is required when `SSO_ORG_BOOTSTRAP=true`");
+        }
+        if !is_valid_email(cfg.sso_org_bootstrap_billing_email.as_deref().unwrap_or_default()) {
+            err!("`SSO_ORG_BOOTSTRAP_BILLING_EMAIL` must be a valid email address");
+        }
+        if cfg.sso_org_bootstrap_collection_name.trim().is_empty() {
+            err!("`SSO_ORG_BOOTSTRAP_COLLECTION_NAME` must not be empty when `SSO_ORG_BOOTSTRAP=true`");
+        }
+        if !is_valid_email(&cfg.sso_org_bot_email) {
+            err!("`SSO_ORG_BOT_EMAIL` must be a valid email address");
+        }
     }
 
     if let Some(ref token) = cfg.admin_token
