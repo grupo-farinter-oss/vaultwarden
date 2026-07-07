@@ -67,6 +67,28 @@ A nearly complete implementation of the Bitwarden Client API is provided, includ
 The recommended way to install and use Vaultwarden is via our container images which are published to [ghcr.io](https://github.com/dani-garcia/vaultwarden/pkgs/container/vaultwarden), [docker.io](https://hub.docker.com/r/vaultwarden/server) and [quay.io](https://quay.io/repository/vaultwarden/server).
 See [which container image to use](https://github.com/dani-garcia/vaultwarden/wiki/Which-container-image-to-use) for an explanation of the provided tags.
 
+### Publishing releases
+
+The `Release` workflow publishes two tag streams:
+
+- Push to `patched` publishes `ghcr.io/dani-garcia/vaultwarden:testing`.
+- Push a tag that matches the release filter, for example `1.36.1` or `1.36.1-patched.1`, publishes `latest` and that release tag.
+
+Examples:
+
+```shell
+# Publish testing
+git checkout patched
+git pull
+git push origin patched
+
+# Publish latest from a release tag
+git checkout patched
+git pull
+git tag 1.36.1-patched.1
+git push origin 1.36.1-patched.1
+```
+
 There are also [community driven packages](https://github.com/dani-garcia/vaultwarden/wiki/Third-party-packages) which can be used, but those might be lagging behind the latest version or might deviate in the way Vaultwarden is configured, as described in our [Wiki](https://github.com/dani-garcia/vaultwarden/wiki).
 
 Alternatively, you can also [build Vaultwarden](https://github.com/dani-garcia/vaultwarden/wiki/Building-binary) yourself.
