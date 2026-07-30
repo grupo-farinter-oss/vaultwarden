@@ -1,5 +1,9 @@
 name: Release
-permissions: {}
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
 
 concurrency:
   # Apply concurrency control only on the upstream repo
@@ -10,11 +14,12 @@ concurrency:
 on:
   push:
     branches:
-      - main
+      - patched
 
     tags:
       # https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#filter-pattern-cheat-sheet
       - '[1-2].[0-9]+.[0-9]+'
+      - '[1-2].[0-9]+.[0-9]+-patched.*'
 
 defaults:
   run:
@@ -34,18 +39,13 @@ defaults:
 #   QUAY_REPO      => QUAY_USERNAME, QUAY_TOKEN
 #   GITHUB_TOKEN is provided automatically
 
+env:
+  GHCR_REPO: ${{ format('ghcr.io/{0}', github.repository) }}
+  CONTAINER_REGISTRIES: ${{ format('ghcr.io/{0}', github.repository) }}
+
 jobs:
   docker-build:
     name: Build Vaultwarden containers
-    if: ${{ github.repository == 'dani-garcia/vaultwarden' }}
-    environment: 
-      name: release
-      deployment: false
-    permissions:
-      packages: write # Needed to upload packages and artifacts
-      contents: read
-      attestations: write # Needed to generate an artifact attestation for a build
-      id-token: write # Needed to mint the OIDC token necessary to request a Sigstore signing certificate
     runs-on: ${{ contains(matrix.arch, 'arm') && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 120
     env:
@@ -126,7 +126,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-        if: ${{ vars.GHCR_REPO != '' }}
 
       - name: Add registry for ghcr.io
         if: ${{ vars.GHCR_REPO != '' }}
@@ -153,7 +152,7 @@ jobs:
 
       - name: Configure build cache from/to
         env:
-          GHCR_REPO: ${{ vars.GHCR_REPO }}
+          GHCR_REPO: ${{ env.GHCR_REPO }}
           BASE_IMAGE: ${{ matrix.base_image }}
           NORMALIZED_ARCH: ${{ env.NORMALIZED_ARCH }}
         run: |
@@ -251,13 +250,6 @@ jobs:
     name: Merge manifests
     runs-on: ubuntu-24.04
     needs: docker-build
-    environment: 
-      name: release
-      deployment: false
-    permissions:
-      packages: write # Needed to upload packages and artifacts
-      attestations: write # Needed to generate an artifact attestation for a build
-      id-token: write # Needed to mint the OIDC token necessary to request a Sigstore signing certificate
     strategy:
       matrix:
         base_image: ["debian","alpine"]
@@ -292,7 +284,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-        if: ${{ vars.GHCR_REPO != '' }}
 
       - name: Add registry for ghcr.io
         if: ${{ vars.GHCR_REPO != '' }}
