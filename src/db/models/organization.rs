@@ -217,11 +217,18 @@ impl Organization {
             "useSecretsManager": false, // Not supported (Not AGPLv3 Licensed)
             "selfHost": true,
             "useApi": true,
+            "useDisableSMAdsForUsers": true, // Hide Secrets Manager ads
+            "useInviteLinks": false, // Not (yet) supported
+            "useMyItems": false, // Not (yet) supported
+            "useOrganizationDomains": false, // Not supported (Linked to SSO)
+            "usePam": false, // Not supported
+            "usePhishingBlocker": false,
             "hasPublicAndPrivateKeys": self.private_key.is_some() && self.public_key.is_some(),
             "useResetPassword": CONFIG.mail_enabled(),
             "allowAdminAccessToAllCollectionItems": true,
             "limitCollectionCreation": true,
             "limitCollectionDeletion": true,
+            "limitItemDeletion": false,
 
             "businessName": self.name,
             "businessAddress1": null,
@@ -495,6 +502,12 @@ impl Membership {
             "useActivateAutofillPolicy": false,
             "useAdminSponsoredFamilies": false,
             "useRiskInsights": false, // Not supported (Not AGPLv3 Licensed)
+            "useDisableSMAdsForUsers": true, // Hide Secrets Manager ads
+            "useInviteLinks": false, // Not (yet) supported
+            "useMyItems": false, // Not (yet) supported
+            "useOrganizationDomains": false, // Not supported (Linked to SSO)
+            "usePam": false, // Not supported
+            "usePhishingBlocker": false,
 
             "organizationUserId": self.uuid,
             "providerId": null,
@@ -550,7 +563,7 @@ impl Membership {
         } else {
             // The Bitwarden clients seem to call this API regardless of whether groups are enabled,
             // so just act as if there are no groups.
-            Vec::with_capacity(0)
+            Vec::new()
         };
 
         // Check if a user is in a group which has access to all collections
@@ -604,7 +617,7 @@ impl Membership {
                 })
                 .collect()
         } else {
-            Vec::with_capacity(0)
+            Vec::new()
         };
 
         // HACK: Convert the manager type to a custom type

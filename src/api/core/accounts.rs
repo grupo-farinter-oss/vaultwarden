@@ -15,7 +15,7 @@ use crate::{
         core::{accept_org_invite, log_user_event, two_factor::email},
         master_password_policy, register_push_device, unregister_push_device,
     },
-    auth::{ClientHeaders, Headers, decode_delete, decode_invite, decode_verify_email},
+    auth::{ClientHeaders, ClientIp, Headers, decode_delete, decode_invite, decode_verify_email},
     crypto,
     db::{
         DbConn, DbPool,
@@ -97,14 +97,11 @@ pub struct RegisterData {
     email: String,
 
     #[serde(flatten)]
-    kdf: KDFData,
+    compat: RegisterDataCompat,
 
-    #[serde(alias = "userSymmetricKey")]
-    key: String,
     #[serde(alias = "userAsymmetricKeys")]
     keys: Option<KeysData>,
 
-    master_password_hash: String,
     master_password_hint: Option<String>,
 
     name: Option<String>,
@@ -119,6 +116,102 @@ pub struct RegisterData {
     org_invite_token: Option<String>,
 }
 
+impl RegisterData {
+    fn hash(&self) -> String {
+        self.compat.fold(|rdc| &rdc.master_password_hash, |rdcu| &rdcu.master_password_authentication.hash).to_owned()
+    }
+
+    fn kdf(&self) -> &KDFData {
+        self.compat.fold(|rdc| &rdc.kdf, |rdcu| &rdcu.master_password_authentication.kdf)
+    }
+
+    fn key(&self) -> String {
+        self.compat.fold(|rdc| &rdc.key, |rdcu| &rdcu.master_password_unlock.key).to_owned()
+    }
+
+    // When comparing with salt, email need to be normalized:
+    //  - https://github.com/bitwarden/clients/blob/web-v2026.5.0/libs/common/src/key-management/master-password/services/master-password.service.ts#L171
+    fn unprocessable(&self) -> bool {
+        let mut unprocessable = false;
+        *self.compat.fold(
+            |_| &false,
+            |rdcu| {
+                let email = self.email.trim().to_lowercase();
+                unprocessable = rdcu.master_password_authentication.kdf != rdcu.master_password_unlock.kdf
+                    || rdcu.master_password_authentication.salt != email
+                    || rdcu.master_password_unlock.salt != email;
+                &unprocessable
+            },
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterDataOld {
+    #[serde(flatten)]
+    kdf: KDFData,
+
+    #[serde(alias = "userSymmetricKey")]
+    key: String,
+
+    #[serde(alias = "masterPasswordHash")]
+    master_password_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterDataCur {
+    master_password_authentication: MasterPasswordAuthentication,
+    master_password_unlock: MasterPasswordUnlock,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RegisterDataCompat {
+    RegisterDataOld(RegisterDataOld),
+    RegisterDataCur(RegisterDataCur),
+}
+
+impl RegisterDataCompat {
+    fn fold<'a, T>(
+        &'a self,
+        fct: impl FnOnce(&'a RegisterDataOld) -> &'a T,
+        fcu: impl FnOnce(&'a RegisterDataCur) -> &'a T,
+    ) -> &'a T {
+        match self {
+            RegisterDataCompat::RegisterDataOld(rdc) => fct(rdc),
+            RegisterDataCompat::RegisterDataCur(rdcu) => fcu(rdcu),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KeysData {
+    encrypted_private_key: String,
+    public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterPasswordAuthentication {
+    kdf: KDFData,
+    salt: String,
+
+    #[serde(alias = "masterPasswordAuthenticationHash")]
+    hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterPasswordUnlock {
+    kdf: KDFData,
+    salt: String,
+
+    #[serde(alias = "masterKeyWrappedUserKey")]
+    key: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetPasswordData {
@@ -130,13 +223,6 @@ pub struct SetPasswordData {
     master_password_hash: String,
     master_password_hint: Option<String>,
     org_identifier: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KeysData {
-    encrypted_private_key: String,
-    public_key: String,
 }
 
 /// Trims whitespace from password hints, and converts blank password hints to `None`.
@@ -176,6 +262,10 @@ pub async fn register(data: Json<RegisterData>, email_verification: bool, conn: 
     let mut email_verified = false;
 
     let mut pending_emergency_access = None;
+
+    if data.unprocessable() {
+        err_code!("Unexpected RegisterData format", Status::UnprocessableEntity.code);
+    }
 
     // First, validate the provided verification tokens
     if email_verification {
@@ -257,8 +347,8 @@ pub async fn register(data: Json<RegisterData>, email_verification: bool, conn: 
                 err!("Registration not allowed or user already exists")
             }
 
-            if let Some(token) = data.org_invite_token {
-                let claims = decode_invite(&token)?;
+            if let Some(token) = data.org_invite_token.as_ref() {
+                let claims = decode_invite(token)?;
                 if claims.email == email {
                     // Verify the email address when signing up via a valid invite token
                     email_verified = true;
@@ -296,9 +386,9 @@ pub async fn register(data: Json<RegisterData>, email_verification: bool, conn: 
     // Make sure we don't leave a lingering invitation.
     Invitation::take(&email, &conn).await;
 
-    set_kdf_data(&mut user, &data.kdf)?;
+    set_kdf_data(&mut user, data.kdf())?;
 
-    user.set_password(&data.master_password_hash, Some(data.key), true, None, &conn).await?;
+    user.set_password(&data.hash(), Some(data.key()), true, None, &conn).await?;
     user.password_hint = password_hint;
 
     // Add extra fields if present
@@ -610,10 +700,6 @@ struct UnlockData {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChangeKdfData {
-    #[allow(dead_code)]
-    new_master_password_hash: String,
-    #[allow(dead_code)]
-    key: String,
     authentication_data: AuthenticationData,
     unlock_data: UnlockData,
     master_password_hash: String,
@@ -1114,7 +1200,9 @@ struct DeleteRecoverData {
 }
 
 #[post("/accounts/delete-recover", data = "<data>")]
-async fn post_delete_recover(data: Json<DeleteRecoverData>, conn: DbConn) -> EmptyResult {
+async fn post_delete_recover(data: Json<DeleteRecoverData>, ip: ClientIp, conn: DbConn) -> EmptyResult {
+    crate::ratelimit::check_limit_unauthenticated(&ip.ip)?;
+
     let data: DeleteRecoverData = data.into_inner();
 
     if CONFIG.mail_enabled() {
@@ -1187,8 +1275,10 @@ struct PasswordHintData {
 }
 
 #[post("/accounts/password-hint", data = "<data>")]
-async fn password_hint(data: Json<PasswordHintData>, conn: DbConn) -> EmptyResult {
+async fn password_hint(data: Json<PasswordHintData>, ip: ClientIp, conn: DbConn) -> EmptyResult {
     const NO_HINT: &str = "Sorry, you have no password hint...";
+
+    crate::ratelimit::check_limit_unauthenticated(&ip.ip)?;
 
     if !CONFIG.password_hints_allowed() || (!CONFIG.mail_enabled() && !CONFIG.show_password_hint()) {
         err!("This server is not configured to provide password hints.");
@@ -1251,6 +1341,13 @@ pub async fn prelogin(data: Json<PreloginData>, conn: DbConn) -> Json<Value> {
         "kdfIterations": kdf_iter,
         "kdfMemory": kdf_mem,
         "kdfParallelism": kdf_para,
+        "kdfSettings": {
+            "iterations": kdf_iter,
+            "kdfType": kdf_type,
+            "memory": kdf_mem,
+            "parallelism": kdf_para
+        },
+        "salt": null,
     }))
 }
 
@@ -1427,7 +1524,9 @@ async fn put_device_token(device_id: DeviceId, data: Json<PushToken>, headers: H
 }
 
 #[put("/devices/identifier/<device_id>/clear-token")]
-async fn put_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResult {
+async fn put_clear_device_token(device_id: DeviceId, ip: ClientIp, conn: DbConn) -> EmptyResult {
+    crate::ratelimit::check_limit_unauthenticated(&ip.ip)?;
+
     // This only clears push token
     // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/Controllers/DevicesController.cs#L215
     // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/Services/Implementations/DeviceService.cs#L37
@@ -1449,8 +1548,8 @@ async fn put_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResul
 
 // On upstream server, both PUT and POST are declared. Implementing the POST method in case it would be useful somewhere
 #[post("/devices/identifier/<device_id>/clear-token")]
-async fn post_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResult {
-    put_clear_device_token(device_id, conn).await
+async fn post_clear_device_token(device_id: DeviceId, ip: ClientIp, conn: DbConn) -> EmptyResult {
+    put_clear_device_token(device_id, ip, conn).await
 }
 
 #[get("/tasks")]
