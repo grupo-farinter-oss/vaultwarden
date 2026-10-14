@@ -384,16 +384,8 @@ async fn auto_confirm_default_org_membership(
 
     OrgPolicy::check_user_allowed(&member, "confirm", conn).await?;
 
-    log_event(
-        EventType::OrganizationUserConfirmed,
-        &member.uuid,
-        &org.uuid,
-        &user.uuid,
-        device.atype,
-        &ip.ip,
-        conn,
-    )
-    .await;
+    log_event(EventType::OrganizationUserConfirmed, &member.uuid, &org.uuid, &user.uuid, device.atype, &ip.ip, conn)
+        .await;
 
     if CONFIG.mail_enabled()
         && let Err(err) = mail::send_invite_confirmed(&user.email, &org.name).await
@@ -575,16 +567,8 @@ pub(crate) async fn reconcile_default_org_membership(
             return Err(err);
         }
 
-        log_event(
-            EventType::OrganizationUserInvited,
-            &member.uuid,
-            &org.uuid,
-            &user.uuid,
-            device.atype,
-            &ip.ip,
-            conn,
-        )
-        .await;
+        log_event(EventType::OrganizationUserInvited, &member.uuid, &org.uuid, &user.uuid, device.atype, &ip.ip, conn)
+            .await;
 
         if CONFIG.sso_org_auto_confirm() {
             if let Err(err) = auto_confirm_default_org_membership(user, device, ip, &org, member, conn).await {
