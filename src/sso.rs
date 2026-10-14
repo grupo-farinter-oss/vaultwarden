@@ -4,7 +4,6 @@ use chrono::Utc;
 use data_encoding::BASE64;
 use derive_more::{AsRef, Deref, Display, From, Into};
 use openssl::{pkey::PKey, rsa::Padding};
-use regex::Regex;
 use url::Url;
 
 use crate::{
@@ -386,7 +385,7 @@ async fn auto_confirm_default_org_membership(
     OrgPolicy::check_user_allowed(&member, "confirm", conn).await?;
 
     log_event(
-        EventType::OrganizationUserConfirmed as i32,
+        EventType::OrganizationUserConfirmed,
         &member.uuid,
         &org.uuid,
         &user.uuid,
@@ -577,7 +576,7 @@ pub(crate) async fn reconcile_default_org_membership(
         }
 
         log_event(
-            EventType::OrganizationUserInvited as i32,
+            EventType::OrganizationUserInvited,
             &member.uuid,
             &org.uuid,
             &user.uuid,
